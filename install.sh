@@ -102,9 +102,13 @@ install_ffmpeg() {
 setup_env() {
     print_step "Configurando variáveis de ambiente..."
     if [[ ! -f "$ROOT_DIR/.env" ]]; then
-        cp "$ROOT_DIR/.env.example" "$ROOT_DIR/.env"
-        print_ok ".env criado a partir do .env.example"
-        print_info "Edite $ROOT_DIR/.env para personalizar as configurações"
+        # Gera .env com caminhos absolutos para evitar problemas de diretório relativo
+        sed "s|DATA_DIR=./data|DATA_DIR=$ROOT_DIR/data|g;
+             s|MESSAGES_DB=./data/messages.db|MESSAGES_DB=$ROOT_DIR/data/messages.db|g;
+             s|SESSION_DB=./data/whatsapp-session.db|SESSION_DB=$ROOT_DIR/data/whatsapp-session.db|g;
+             s|MEDIA_DIR=./data/media|MEDIA_DIR=$ROOT_DIR/data/media|g" \
+             "$ROOT_DIR/.env.example" > "$ROOT_DIR/.env"
+        print_ok ".env criado com caminhos absolutos"
     else
         print_ok ".env já existe"
     fi

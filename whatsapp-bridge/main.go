@@ -18,6 +18,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -179,6 +180,8 @@ func eventHandler(rawEvt interface{}) {
 	switch evt := rawEvt.(type) {
 	case *events.Message:
 		handleMessage(evt)
+	case *events.HistorySync:
+		handleHistorySync(evt)
 	case *events.GroupInfo:
 		handleGroupInfo(evt)
 	case *events.PushNameSetting:
@@ -193,6 +196,134 @@ func eventHandler(rawEvt interface{}) {
 		fmt.Println("[Bridge] Sessão encerrada. Delete whatsapp-session.db para fazer login novamente.")
 		os.Exit(0)
 	}
+}
+
+// handleHistorySync processa o histórico de mensagens enviado pelo WhatsApp na conexão
+func handleHistorySync(evt *events.HistorySync) {
+	data := evt.Data
+	if data == nil {
+		return
+	}
+
+	total := 0
+	for _, conv := range data.GetConversations() {
+		chatJID := conv.GetID()
+		if chatJID == "" {
+			continue
+		}
+
+		// Nome do chat
+		chatName := conv.GetName()
+		isGroup := strings.Contains(chatJID, "@g.us")
+
+		// Salva/atualiza o chat
+		_, _ = msgDB.Exec(
+			`INSERT INTO chats (jid, name, is_group, updated_at)
+			VALUES (?, ?, ?, strftime('%s', 'now'))
+			ON CONFLICT(jid) DO UPDATE SET
+				name = COALESCE(NULLIF(excluded.name, ''), name),
+				updated_at = excluded.updated_at`,
+			chatJID, chatName, boolToInt(isGroup),
+		)
+
+		for _, histMsg := range conv.GetMessages() {
+			webMsg := histMsg.GetMessage()
+			if webMsg == nil {
+				continue
+			}
+
+			msgInfo := webMsg.GetMessage()
+			if msgInfo == nil {
+				continue
+			}
+
+			msgID := webMsg.GetKey().GetID()
+			senderJID := chatJID
+			isFromMe := webMsg.GetKey().GetFromMe()
+
+			if !isFromMe && webMsg.GetKey().GetParticipant() != "" {
+				senderJID = webMsg.GetKey().GetParticipant()
+			} else if !isFromMe && isGroup {
+				continue
+			}
+
+			senderName := webMsg.GetPushName()
+			timestamp := int64(webMsg.GetMessageTimestamp())
+
+			msgType, content, _ := extractFromProto(msgInfo)
+			if msgType == "" {
+				continue
+			}
+
+			_, err := msgDB.Exec(
+				`INSERT OR IGNORE INTO messages
+				(id, chat_jid, sender_jid, sender_name, content, message_type, timestamp, is_from_me)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				msgID, chatJID, senderJID, senderName, content, msgType, timestamp, boolToInt(isFromMe),
+			)
+			if err == nil {
+				total++
+				// Atualiza last_message_time do chat
+				_, _ = msgDB.Exec(
+					`UPDATE chats SET last_message_time = MAX(COALESCE(last_message_time, 0), ?)
+					WHERE jid = ?`, timestamp, chatJID,
+				)
+			}
+		}
+	}
+
+	syncType := data.GetSyncType().String()
+	fmt.Printf("[Bridge] HistorySync (%s): %d mensagens salvas\n", syncType, total)
+}
+
+// extractFromProto extrai tipo e conteúdo de um proto de mensagem (usado no history sync)
+func extractFromProto(msg *waE2E.Message) (msgType, content, mediaPath string) {
+	if msg == nil {
+		return "", "", ""
+	}
+	if text := msg.GetConversation(); text != "" {
+		return "text", text, ""
+	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil && ext.GetText() != "" {
+		return "text", ext.GetText(), ""
+	}
+	if audio := msg.GetAudioMessage(); audio != nil {
+		if audio.GetPTT() {
+			return "ptt", "[Mensagem de voz]", ""
+		}
+		return "audio", "[Áudio]", ""
+	}
+	if img := msg.GetImageMessage(); img != nil {
+		caption := img.GetCaption()
+		if caption == "" {
+			caption = "[Imagem]"
+		}
+		return "image", caption, ""
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		caption := vid.GetCaption()
+		if caption == "" {
+			caption = "[Vídeo]"
+		}
+		return "video", caption, ""
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return "document", fmt.Sprintf("[Documento: %s]", doc.GetFileName()), ""
+	}
+	if msg.GetStickerMessage() != nil {
+		return "sticker", "[Sticker]", ""
+	}
+	if loc := msg.GetLocationMessage(); loc != nil {
+		return "location", fmt.Sprintf("[Localização: %.6f, %.6f]", loc.GetDegreesLatitude(), loc.GetDegreesLongitude()), ""
+	}
+	if contact := msg.GetContactMessage(); contact != nil {
+		return "contact", fmt.Sprintf("[Contato: %s]", contact.GetDisplayName()), ""
+	}
+	if reaction := msg.GetReactionMessage(); reaction != nil {
+		return "reaction", fmt.Sprintf("[Reação: %s]", reaction.GetText()), ""
+	}
+	_ = waHistorySync.HistorySync_RECENT // garante que o import seja usado
+	return "", "", ""
 }
 
 // handleMessage processa e salva uma mensagem recebida
