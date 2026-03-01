@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +25,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
 
 var (
@@ -32,29 +35,35 @@ var (
 	ctx      = context.Background()
 )
 
+// audioMediaInfo armazena metadados necessários para baixar áudio do histórico
+type audioMediaInfo struct {
+	URL           string `json:"url"`
+	DirectPath    string `json:"direct_path"`
+	MediaKey      string `json:"media_key"`       // base64
+	FileEncSHA256 string `json:"file_enc_sha256"` // base64
+	FileSHA256    string `json:"file_sha256"`     // base64
+	FileLength    uint64 `json:"file_length"`
+	Mimetype      string `json:"mimetype"`
+	PTT           bool   `json:"ptt"`
+}
+
 func main() {
-	// Carrega variáveis de ambiente
 	_ = godotenv.Load("../.env")
 
 	sessionDB := getEnv("SESSION_DB", "./data/whatsapp-session.db")
 	messagesDB := getEnv("MESSAGES_DB", "./data/messages.db")
 	mediaDir = getEnv("MEDIA_DIR", "./data/media")
+	bridgePort := getEnv("BRIDGE_PORT", "8765")
 
-	// Cria diretórios necessários
-	for _, dir := range []string{
-		filepath.Dir(sessionDB),
-		filepath.Dir(messagesDB),
-		mediaDir,
-	} {
+	for _, dir := range []string{filepath.Dir(sessionDB), filepath.Dir(messagesDB), mediaDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "Erro ao criar diretório %s: %v\n", dir, err)
 			os.Exit(1)
 		}
 	}
 
-	// Inicializa banco de dados de mensagens
 	var err error
-	msgDB, err = sql.Open("sqlite3", messagesDB+"?_journal_mode=WAL&_foreign_keys=on&_fts5=1")
+	msgDB, err = sql.Open("sqlite3", messagesDB+"?_journal_mode=WAL&_foreign_keys=on")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Erro ao abrir banco de dados: %v\n", err)
 		os.Exit(1)
@@ -66,7 +75,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Inicializa store da sessão WhatsApp
 	dbLog := waLog.Stdout("Database", "ERROR", true)
 	container, err := sqlstore.New(ctx, "sqlite3", "file:"+sessionDB+"?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -84,9 +92,10 @@ func main() {
 	client = whatsmeow.NewClient(deviceStore, clientLog)
 	client.AddEventHandler(eventHandler)
 
-	// Conecta ao WhatsApp
+	// Inicia HTTP server para download sob demanda
+	go startHTTPServer(bridgePort)
+
 	if client.Store.ID == nil {
-		// Primeira vez: necessário escanear QR code
 		qrChan, _ := client.GetQRChannel(ctx)
 		if err := client.Connect(); err != nil {
 			fmt.Fprintf(os.Stderr, "Erro ao conectar: %v\n", err)
@@ -104,7 +113,6 @@ func main() {
 			}
 		}
 	} else {
-		// Sessão existente: reconecta automaticamente
 		if err := client.Connect(); err != nil {
 			fmt.Fprintf(os.Stderr, "Erro ao reconectar: %v\n", err)
 			os.Exit(1)
@@ -112,10 +120,9 @@ func main() {
 		fmt.Printf("Conectado como: %s\n", client.Store.ID.String())
 	}
 
-	fmt.Println("\nWhatsApp Bridge rodando. Aguardando mensagens...")
+	fmt.Printf("\nWhatsApp Bridge rodando (API em :%s). Aguardando mensagens...\n", bridgePort)
 	fmt.Println("Pressione Ctrl+C para encerrar.")
 
-	// Aguarda sinal de encerramento
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
@@ -124,7 +131,138 @@ func main() {
 	client.Disconnect()
 }
 
-// initMessagesDB cria as tabelas necessárias no banco de dados
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP Server para download sob demanda
+// ─────────────────────────────────────────────────────────────────────────────
+
+func startHTTPServer(port string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/download", handleDownload)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"status":"ok"}`)
+	})
+	fmt.Printf("[Bridge] HTTP API iniciada em :%s\n", port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		fmt.Fprintf(os.Stderr, "[Bridge] Erro no HTTP server: %v\n", err)
+	}
+}
+
+// handleDownload baixa um áudio histórico e retorna o caminho do arquivo
+func handleDownload(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	msgID := r.URL.Query().Get("id")
+	chatJID := r.URL.Query().Get("jid")
+
+	if msgID == "" || chatJID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":"id e jid são obrigatórios"}`)
+		return
+	}
+
+	// Busca a mensagem no banco
+	var mediaInfoJSON, mediaPath sql.NullString
+	var msgType string
+	err := msgDB.QueryRow(
+		`SELECT message_type, media_path, media_info FROM messages WHERE id = ? AND chat_jid = ?`,
+		msgID, chatJID,
+	).Scan(&msgType, &mediaPath, &mediaInfoJSON)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, `{"error":"mensagem não encontrada: %s"}`, err)
+		return
+	}
+
+	// Já tem arquivo baixado
+	if mediaPath.Valid && mediaPath.String != "" {
+		if _, err := os.Stat(mediaPath.String); err == nil {
+			resp, _ := json.Marshal(map[string]string{"path": mediaPath.String})
+			fmt.Fprint(w, string(resp))
+			return
+		}
+	}
+
+	// Precisa baixar — verifica se temos os metadados
+	if !mediaInfoJSON.Valid || mediaInfoJSON.String == "" {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		fmt.Fprint(w, `{"error":"metadados de mídia não disponíveis para esta mensagem histórica"}`)
+		return
+	}
+
+	var info audioMediaInfo
+	if err := json.Unmarshal([]byte(mediaInfoJSON.String), &info); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"error":"erro ao decodificar metadados: %s"}`, err)
+		return
+	}
+
+	// Reconstrói o proto AudioMessage para download
+	mediaKey, _ := base64.StdEncoding.DecodeString(info.MediaKey)
+	fileEncSHA256, _ := base64.StdEncoding.DecodeString(info.FileEncSHA256)
+	fileSHA256, _ := base64.StdEncoding.DecodeString(info.FileSHA256)
+
+	audioMsg := &waE2E.AudioMessage{
+		URL:           proto.String(info.URL),
+		DirectPath:    proto.String(info.DirectPath),
+		MediaKey:      mediaKey,
+		FileEncSHA256: fileEncSHA256,
+		FileSHA256:    fileSHA256,
+		FileLength:    proto.Uint64(info.FileLength),
+		Mimetype:      proto.String(info.Mimetype),
+		PTT:           proto.Bool(info.PTT),
+	}
+
+	data, err := client.Download(ctx, audioMsg)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"error":"erro ao baixar áudio: %s"}`, err)
+		return
+	}
+
+	// Determina extensão
+	fileExt := ".ogg"
+	if strings.Contains(info.Mimetype, "mp4") {
+		fileExt = ".mp4"
+	}
+
+	subdir := "ptt"
+	if !info.PTT {
+		subdir = "audio"
+	}
+
+	safeID := strings.ReplaceAll(msgID, "/", "_")
+	safeJID := strings.ReplaceAll(strings.ReplaceAll(chatJID, "@", "_"), ".", "_")
+	filename := fmt.Sprintf("%s_%s%s", safeJID, safeID, fileExt)
+	path := filepath.Join(mediaDir, subdir, filename)
+
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"error":"erro ao criar diretório: %s"}`, err)
+		return
+	}
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"error":"erro ao salvar arquivo: %s"}`, err)
+		return
+	}
+
+	// Atualiza media_path no banco
+	_, _ = msgDB.Exec(
+		`UPDATE messages SET media_path = ? WHERE id = ? AND chat_jid = ?`,
+		path, msgID, chatJID,
+	)
+
+	fmt.Printf("[Bridge] Áudio baixado sob demanda: %s\n", path)
+	resp, _ := json.Marshal(map[string]string{"path": path})
+	fmt.Fprint(w, string(resp))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inicialização do banco de dados
+// ─────────────────────────────────────────────────────────────────────────────
+
 func initMessagesDB() error {
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS chats (
@@ -145,6 +283,7 @@ func initMessagesDB() error {
 			timestamp INTEGER NOT NULL,
 			is_from_me INTEGER NOT NULL DEFAULT 0,
 			media_path TEXT,
+			media_info TEXT,
 			transcription TEXT,
 			PRIMARY KEY (id, chat_jid)
 		)`,
@@ -172,10 +311,17 @@ func initMessagesDB() error {
 			return fmt.Errorf("erro ao executar query: %w\n%s", err, q)
 		}
 	}
+
+	// Migração: adiciona coluna media_info se não existir (para DBs antigos)
+	_, _ = msgDB.Exec(`ALTER TABLE messages ADD COLUMN media_info TEXT`)
+
 	return nil
 }
 
-// eventHandler processa todos os eventos do WhatsApp
+// ─────────────────────────────────────────────────────────────────────────────
+// Event handlers
+// ─────────────────────────────────────────────────────────────────────────────
+
 func eventHandler(rawEvt interface{}) {
 	switch evt := rawEvt.(type) {
 	case *events.Message:
@@ -198,7 +344,50 @@ func eventHandler(rawEvt interface{}) {
 	}
 }
 
-// handleHistorySync processa o histórico de mensagens enviado pelo WhatsApp na conexão
+func handleMessage(evt *events.Message) {
+	msg := evt.Message
+	if msg == nil {
+		return
+	}
+
+	chatJID := evt.Info.Chat.String()
+	senderJID := evt.Info.Sender.String()
+	senderName := getSenderName(evt)
+	isFromMe := evt.Info.IsFromMe
+	timestamp := evt.Info.Timestamp.Unix()
+	msgID := evt.Info.ID
+
+	msgType, content, mediaPath := extractMessage(evt)
+	if msgType == "" {
+		return
+	}
+
+	_, err := msgDB.Exec(
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender_jid, sender_name, content, message_type, timestamp, is_from_me, media_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		msgID, chatJID, senderJID, senderName, content, msgType, timestamp, boolToInt(isFromMe), mediaPath,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[Bridge] Erro ao salvar mensagem %s: %v\n", msgID, err)
+		return
+	}
+
+	updateChat(evt, chatJID, timestamp)
+	if senderName != "" {
+		updateContact(senderJID, "", senderName)
+	}
+
+	direction := "<<"
+	if isFromMe {
+		direction = ">>"
+	}
+	fmt.Printf("[%s] %s %s (%s): %s\n",
+		time.Unix(timestamp, 0).Format("15:04"),
+		direction, chatJID, senderName, truncate(content, 80),
+	)
+}
+
 func handleHistorySync(evt *events.HistorySync) {
 	data := evt.Data
 	if data == nil {
@@ -212,11 +401,9 @@ func handleHistorySync(evt *events.HistorySync) {
 			continue
 		}
 
-		// Nome do chat
 		chatName := conv.GetName()
 		isGroup := strings.Contains(chatJID, "@g.us")
 
-		// Salva/atualiza o chat
 		_, _ = msgDB.Exec(
 			`INSERT INTO chats (jid, name, is_group, updated_at)
 			VALUES (?, ?, ?, strftime('%s', 'now'))
@@ -250,23 +437,27 @@ func handleHistorySync(evt *events.HistorySync) {
 			senderName := webMsg.GetPushName()
 			timestamp := int64(webMsg.GetMessageTimestamp())
 
-			msgType, content, _ := extractFromProto(msgInfo)
+			msgType, content, mediaInfoJSON := extractFromProto(msgInfo)
 			if msgType == "" {
 				continue
 			}
 
+			var mediaInfoArg interface{} = nil
+			if mediaInfoJSON != "" {
+				mediaInfoArg = mediaInfoJSON
+			}
+
 			_, err := msgDB.Exec(
 				`INSERT OR IGNORE INTO messages
-				(id, chat_jid, sender_jid, sender_name, content, message_type, timestamp, is_from_me)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-				msgID, chatJID, senderJID, senderName, content, msgType, timestamp, boolToInt(isFromMe),
+				(id, chat_jid, sender_jid, sender_name, content, message_type, timestamp, is_from_me, media_info)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				msgID, chatJID, senderJID, senderName, content, msgType, timestamp, boolToInt(isFromMe), mediaInfoArg,
 			)
 			if err == nil {
 				total++
-				// Atualiza last_message_time do chat
 				_, _ = msgDB.Exec(
-					`UPDATE chats SET last_message_time = MAX(COALESCE(last_message_time, 0), ?)
-					WHERE jid = ?`, timestamp, chatJID,
+					`UPDATE chats SET last_message_time = MAX(COALESCE(last_message_time, 0), ?) WHERE jid = ?`,
+					timestamp, chatJID,
 				)
 			}
 		}
@@ -274,10 +465,71 @@ func handleHistorySync(evt *events.HistorySync) {
 
 	syncType := data.GetSyncType().String()
 	fmt.Printf("[Bridge] HistorySync (%s): %d mensagens salvas\n", syncType, total)
+	_ = waHistorySync.HistorySync_RECENT
 }
 
-// extractFromProto extrai tipo e conteúdo de um proto de mensagem (usado no history sync)
-func extractFromProto(msg *waE2E.Message) (msgType, content, mediaPath string) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Extração de mensagens
+// ─────────────────────────────────────────────────────────────────────────────
+
+func extractMessage(evt *events.Message) (msgType, content, mediaPath string) {
+	msg := evt.Message
+
+	if text := msg.GetConversation(); text != "" {
+		return "text", text, ""
+	}
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		return "text", ext.GetText(), ""
+	}
+	if audio := msg.GetAudioMessage(); audio != nil {
+		msgType = "audio"
+		if audio.GetPTT() {
+			msgType = "ptt"
+		}
+		if getEnv("AUTO_DOWNLOAD_AUDIO", "true") == "true" {
+			path := downloadMediaMsg(evt, audio, msgType)
+			return msgType, "[Mensagem de áudio]", path
+		}
+		return msgType, "[Mensagem de áudio]", ""
+	}
+	if img := msg.GetImageMessage(); img != nil {
+		caption := img.GetCaption()
+		if caption == "" {
+			caption = "[Imagem]"
+		}
+		if getEnv("AUTO_DOWNLOAD_IMAGES", "false") == "true" {
+			path := downloadMediaMsg(evt, img, "image")
+			return "image", caption, path
+		}
+		return "image", caption, ""
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		caption := vid.GetCaption()
+		if caption == "" {
+			caption = "[Vídeo]"
+		}
+		return "video", caption, ""
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return "document", fmt.Sprintf("[Documento: %s]", doc.GetFileName()), ""
+	}
+	if msg.GetStickerMessage() != nil {
+		return "sticker", "[Sticker]", ""
+	}
+	if loc := msg.GetLocationMessage(); loc != nil {
+		return "location", fmt.Sprintf("[Localização: %.6f, %.6f]", loc.GetDegreesLatitude(), loc.GetDegreesLongitude()), ""
+	}
+	if contact := msg.GetContactMessage(); contact != nil {
+		return "contact", fmt.Sprintf("[Contato: %s]", contact.GetDisplayName()), ""
+	}
+	if reaction := msg.GetReactionMessage(); reaction != nil {
+		return "reaction", fmt.Sprintf("[Reação: %s]", reaction.GetText()), ""
+	}
+	return "", "", ""
+}
+
+// extractFromProto extrai tipo, conteúdo e media_info JSON de mensagens do history sync
+func extractFromProto(msg *waE2E.Message) (msgType, content, mediaInfoJSON string) {
 	if msg == nil {
 		return "", "", ""
 	}
@@ -288,10 +540,32 @@ func extractFromProto(msg *waE2E.Message) (msgType, content, mediaPath string) {
 		return "text", ext.GetText(), ""
 	}
 	if audio := msg.GetAudioMessage(); audio != nil {
-		if audio.GetPTT() {
-			return "ptt", "[Mensagem de voz]", ""
+		isPTT := audio.GetPTT()
+		t := "audio"
+		if isPTT {
+			t = "ptt"
 		}
-		return "audio", "[Áudio]", ""
+		info := audioMediaInfo{
+			URL:           audio.GetURL(),
+			DirectPath:    audio.GetDirectPath(),
+			MediaKey:      base64.StdEncoding.EncodeToString(audio.GetMediaKey()),
+			FileEncSHA256: base64.StdEncoding.EncodeToString(audio.GetFileEncSHA256()),
+			FileSHA256:    base64.StdEncoding.EncodeToString(audio.GetFileSHA256()),
+			FileLength:    audio.GetFileLength(),
+			Mimetype:      audio.GetMimetype(),
+			PTT:           isPTT,
+		}
+		// Só salva media_info se tiver URL (mensagens recentes têm, antigas não)
+		jsonStr := ""
+		if info.URL != "" && info.MediaKey != "" {
+			b, _ := json.Marshal(info)
+			jsonStr = string(b)
+		}
+		label := "[Mensagem de voz]"
+		if !isPTT {
+			label = "[Áudio]"
+		}
+		return t, label, jsonStr
 	}
 	if img := msg.GetImageMessage(); img != nil {
 		caption := img.GetCaption()
@@ -322,144 +596,11 @@ func extractFromProto(msg *waE2E.Message) (msgType, content, mediaPath string) {
 	if reaction := msg.GetReactionMessage(); reaction != nil {
 		return "reaction", fmt.Sprintf("[Reação: %s]", reaction.GetText()), ""
 	}
-	_ = waHistorySync.HistorySync_RECENT // garante que o import seja usado
 	return "", "", ""
 }
 
-// handleMessage processa e salva uma mensagem recebida
-func handleMessage(evt *events.Message) {
-	msg := evt.Message
-	if msg == nil {
-		return
-	}
-
-	chatJID := evt.Info.Chat.String()
-	senderJID := evt.Info.Sender.String()
-	senderName := getSenderName(evt)
-	isFromMe := evt.Info.IsFromMe
-	timestamp := evt.Info.Timestamp.Unix()
-	msgID := evt.Info.ID
-
-	// Determina o tipo e conteúdo da mensagem
-	msgType, content, mediaPath := extractMessage(evt)
-	if msgType == "" {
-		return // Ignora tipos não suportados
-	}
-
-	// Salva no banco de dados
-	_, err := msgDB.Exec(
-		`INSERT OR REPLACE INTO messages
-		(id, chat_jid, sender_jid, sender_name, content, message_type, timestamp, is_from_me, media_path)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		msgID, chatJID, senderJID, senderName, content, msgType, timestamp, boolToInt(isFromMe), mediaPath,
-	)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[Bridge] Erro ao salvar mensagem %s: %v\n", msgID, err)
-		return
-	}
-
-	// Atualiza informações do chat
-	updateChat(evt, chatJID, timestamp)
-
-	// Atualiza contato
-	if senderName != "" {
-		updateContact(senderJID, "", senderName)
-	}
-
-	direction := "<<"
-	if isFromMe {
-		direction = ">>"
-	}
-	fmt.Printf("[%s] %s %s (%s): %s\n",
-		time.Unix(timestamp, 0).Format("15:04"),
-		direction,
-		chatJID,
-		senderName,
-		truncate(content, 80),
-	)
-}
-
-// extractMessage extrai tipo, conteúdo e caminho de mídia de uma mensagem
-func extractMessage(evt *events.Message) (msgType, content, mediaPath string) {
-	msg := evt.Message
-
-	// Texto simples
-	if text := msg.GetConversation(); text != "" {
-		return "text", text, ""
-	}
-
-	// Texto estendido (com preview de link, etc.)
-	if ext := msg.GetExtendedTextMessage(); ext != nil {
-		return "text", ext.GetText(), ""
-	}
-
-	// Áudio / PTT (Push-to-Talk)
-	if audio := msg.GetAudioMessage(); audio != nil {
-		msgType = "audio"
-		if audio.GetPTT() {
-			msgType = "ptt"
-		}
-		autoDownload := getEnv("AUTO_DOWNLOAD_AUDIO", "true") == "true"
-		if autoDownload {
-			path := downloadMedia(evt, audio, msgType)
-			return msgType, "[Mensagem de áudio]", path
-		}
-		return msgType, "[Mensagem de áudio]", ""
-	}
-
-	// Imagem
-	if img := msg.GetImageMessage(); img != nil {
-		caption := img.GetCaption()
-		if caption == "" {
-			caption = "[Imagem]"
-		}
-		autoDownload := getEnv("AUTO_DOWNLOAD_IMAGES", "false") == "true"
-		if autoDownload {
-			path := downloadMedia(evt, img, "image")
-			return "image", caption, path
-		}
-		return "image", caption, ""
-	}
-
-	// Vídeo
-	if vid := msg.GetVideoMessage(); vid != nil {
-		caption := vid.GetCaption()
-		if caption == "" {
-			caption = "[Vídeo]"
-		}
-		return "video", caption, ""
-	}
-
-	// Documento
-	if doc := msg.GetDocumentMessage(); doc != nil {
-		return "document", fmt.Sprintf("[Documento: %s]", doc.GetFileName()), ""
-	}
-
-	// Sticker
-	if msg.GetStickerMessage() != nil {
-		return "sticker", "[Sticker]", ""
-	}
-
-	// Localização
-	if loc := msg.GetLocationMessage(); loc != nil {
-		return "location", fmt.Sprintf("[Localização: %.6f, %.6f]", loc.GetDegreesLatitude(), loc.GetDegreesLongitude()), ""
-	}
-
-	// Contato
-	if contact := msg.GetContactMessage(); contact != nil {
-		return "contact", fmt.Sprintf("[Contato: %s]", contact.GetDisplayName()), ""
-	}
-
-	// Reação
-	if reaction := msg.GetReactionMessage(); reaction != nil {
-		return "reaction", fmt.Sprintf("[Reação: %s]", reaction.GetText()), ""
-	}
-
-	return "", "", ""
-}
-
-// downloadMedia baixa um arquivo de mídia e salva localmente
-func downloadMedia(evt *events.Message, mediaMsg interface{}, mediaType string) string {
+// downloadMediaMsg baixa mídia de mensagens em tempo real
+func downloadMediaMsg(evt *events.Message, mediaMsg interface{}, mediaType string) string {
 	var url, mimetype, fileExt string
 	var mediaKey []byte
 
@@ -488,7 +629,6 @@ func downloadMedia(evt *events.Message, mediaMsg interface{}, mediaType string) 
 		return ""
 	}
 
-	// Usa o cliente whatsmeow para baixar corretamente (descriptografa)
 	var data []byte
 	var err error
 
@@ -500,7 +640,6 @@ func downloadMedia(evt *events.Message, mediaMsg interface{}, mediaType string) 
 	}
 
 	if err != nil {
-		// Fallback: tenta baixar direto via HTTP
 		resp, httpErr := http.Get(url)
 		if httpErr != nil {
 			fmt.Fprintf(os.Stderr, "[Bridge] Erro ao baixar mídia: %v\n", err)
@@ -513,28 +652,26 @@ func downloadMedia(evt *events.Message, mediaMsg interface{}, mediaType string) 
 		}
 	}
 
-	// Salva o arquivo
-	filename := fmt.Sprintf("%s_%s%s", evt.Info.Chat.String(), evt.Info.ID, fileExt)
-	filename = strings.ReplaceAll(filename, "@", "_")
-	filename = strings.ReplaceAll(filename, ".", "_") + fileExt
+	safeChat := strings.ReplaceAll(strings.ReplaceAll(evt.Info.Chat.String(), "@", "_"), ".", "_")
+	filename := fmt.Sprintf("%s_%s%s", safeChat, evt.Info.ID, fileExt)
 	path := filepath.Join(mediaDir, mediaType, filename)
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return ""
 	}
-
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "[Bridge] Erro ao salvar mídia: %v\n", err)
 		return ""
 	}
-
 	return path
 }
 
-// updateChat atualiza as informações de um chat no banco
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers de banco de dados
+// ─────────────────────────────────────────────────────────────────────────────
+
 func updateChat(evt *events.Message, chatJID string, timestamp int64) {
 	isGroup := evt.Info.Chat.Server == types.GroupServer
-
 	var name string
 	if isGroup {
 		groupInfo, err := client.GetGroupInfo(ctx, evt.Info.Chat)
@@ -547,7 +684,6 @@ func updateChat(evt *events.Message, chatJID string, timestamp int64) {
 			name = evt.Info.Sender.User
 		}
 	}
-
 	_, err := msgDB.Exec(
 		`INSERT INTO chats (jid, name, is_group, last_message_time, updated_at)
 		VALUES (?, ?, ?, ?, strftime('%s', 'now'))
@@ -562,7 +698,6 @@ func updateChat(evt *events.Message, chatJID string, timestamp int64) {
 	}
 }
 
-// handleGroupInfo processa eventos de informações de grupo
 func handleGroupInfo(evt *events.GroupInfo) {
 	if evt.Name != nil {
 		_, err := msgDB.Exec(
@@ -577,7 +712,6 @@ func handleGroupInfo(evt *events.GroupInfo) {
 	}
 }
 
-// updateContact atualiza informações de um contato
 func updateContact(jid, name, pushName string) {
 	_, _ = msgDB.Exec(
 		`INSERT INTO contacts (jid, name, push_name, updated_at)
@@ -590,7 +724,10 @@ func updateContact(jid, name, pushName string) {
 	)
 }
 
-// getSenderName retorna o nome de exibição do remetente
+// ─────────────────────────────────────────────────────────────────────────────
+// Utilitários
+// ─────────────────────────────────────────────────────────────────────────────
+
 func getSenderName(evt *events.Message) string {
 	if evt.Info.PushName != "" {
 		return evt.Info.PushName
@@ -598,7 +735,6 @@ func getSenderName(evt *events.Message) string {
 	return evt.Info.Sender.User
 }
 
-// getEnv retorna o valor de uma variável de ambiente ou o padrão
 func getEnv(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
@@ -606,7 +742,6 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
-// boolToInt converte bool para int (para SQLite)
 func boolToInt(b bool) int {
 	if b {
 		return 1
@@ -614,7 +749,6 @@ func boolToInt(b bool) int {
 	return 0
 }
 
-// truncate limita uma string a n caracteres
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

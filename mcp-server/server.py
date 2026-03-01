@@ -18,10 +18,28 @@ load_dotenv(_root / ".env")
 # Adiciona o diretório do servidor ao path
 sys.path.insert(0, str(Path(__file__).parent))
 
+import json
+import urllib.request
+import urllib.parse
+
 import database as db
 import transcriber
 
 from mcp.server.fastmcp import FastMCP
+
+BRIDGE_PORT = os.getenv("BRIDGE_PORT", "8765")
+
+
+def _download_audio_from_bridge(msg_id: str, chat_jid: str) -> Optional[str]:
+    """Pede ao bridge Go para baixar um áudio histórico. Retorna o caminho ou None."""
+    params = urllib.parse.urlencode({"id": msg_id, "jid": chat_jid})
+    url = f"http://localhost:{BRIDGE_PORT}/download?{params}"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = json.loads(resp.read())
+            return data.get("path")
+    except Exception as e:
+        return None
 
 mcp = FastMCP(
     "WhatsApp",
@@ -256,11 +274,19 @@ def transcrever_audio(
         )
 
     media_path = msg.get("media_path")
-    if not media_path:
-        return (
-            "Arquivo de áudio não disponível localmente.\n"
-            "O bridge precisa estar configurado com AUTO_DOWNLOAD_AUDIO=true."
-        )
+
+    # Se não tem arquivo local, tenta baixar sob demanda via bridge API
+    if not media_path or not os.path.exists(media_path or ""):
+        print(f"[MCP] Solicitando download ao bridge: {id_mensagem}", flush=True)
+        media_path = _download_audio_from_bridge(id_mensagem, jid_conversa)
+        if not media_path:
+            return (
+                "Não foi possível baixar o áudio.\n"
+                "Possíveis causas:\n"
+                "• Mensagem muito antiga (WhatsApp expira mídias após ~60 dias)\n"
+                "• Bridge não está rodando — execute `./start.sh`\n"
+                "• Metadados de download não disponíveis para esta mensagem"
+            )
 
     if not os.path.exists(media_path):
         return f"Arquivo de áudio não encontrado: {media_path}"
