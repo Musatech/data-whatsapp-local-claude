@@ -135,7 +135,7 @@ build_bridge() {
     go mod tidy
 
     print_info "Compilando..."
-    go build -o whatsapp-bridge .
+    go build -tags "fts5" -o whatsapp-bridge .
 
     if [[ -f "$ROOT_DIR/whatsapp-bridge/whatsapp-bridge" ]]; then
         print_ok "Bridge compilado com sucesso"

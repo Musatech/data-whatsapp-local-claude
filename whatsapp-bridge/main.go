@@ -22,13 +22,13 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
-	"google.golang.org/protobuf/proto"
 )
 
 var (
 	msgDB    *sql.DB
 	mediaDir string
 	client   *whatsmeow.Client
+	ctx      = context.Background()
 )
 
 func main() {
@@ -53,7 +53,7 @@ func main() {
 
 	// Inicializa banco de dados de mensagens
 	var err error
-	msgDB, err = sql.Open("sqlite3", messagesDB+"?_journal_mode=WAL&_foreign_keys=on")
+	msgDB, err = sql.Open("sqlite3", messagesDB+"?_journal_mode=WAL&_foreign_keys=on&_fts5=1")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Erro ao abrir banco de dados: %v\n", err)
 		os.Exit(1)
@@ -67,13 +67,13 @@ func main() {
 
 	// Inicializa store da sessão WhatsApp
 	dbLog := waLog.Stdout("Database", "ERROR", true)
-	container, err := sqlstore.New("sqlite3", "file:"+sessionDB+"?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(ctx, "sqlite3", "file:"+sessionDB+"?_foreign_keys=on", dbLog)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Erro ao inicializar store: %v\n", err)
 		os.Exit(1)
 	}
 
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Erro ao obter dispositivo: %v\n", err)
 		os.Exit(1)
@@ -86,7 +86,7 @@ func main() {
 	// Conecta ao WhatsApp
 	if client.Store.ID == nil {
 		// Primeira vez: necessário escanear QR code
-		qrChan, _ := client.GetQRChannel(context.Background())
+		qrChan, _ := client.GetQRChannel(ctx)
 		if err := client.Connect(); err != nil {
 			fmt.Fprintf(os.Stderr, "Erro ao conectar: %v\n", err)
 			os.Exit(1)
@@ -265,7 +265,7 @@ func extractMessage(evt *events.Message) (msgType, content, mediaPath string) {
 	// Áudio / PTT (Push-to-Talk)
 	if audio := msg.GetAudioMessage(); audio != nil {
 		msgType = "audio"
-		if audio.GetPtt() {
+		if audio.GetPTT() {
 			msgType = "ptt"
 		}
 		autoDownload := getEnv("AUTO_DOWNLOAD_AUDIO", "true") == "true"
@@ -327,11 +327,6 @@ func extractMessage(evt *events.Message) (msgType, content, mediaPath string) {
 	return "", "", ""
 }
 
-// mediaDownloader interface para polimorfismo na função downloadMedia
-type mediaMessage interface {
-	proto.Message
-}
-
 // downloadMedia baixa um arquivo de mídia e salva localmente
 func downloadMedia(evt *events.Message, mediaMsg interface{}, mediaType string) string {
 	var url, mimetype, fileExt string
@@ -339,7 +334,7 @@ func downloadMedia(evt *events.Message, mediaMsg interface{}, mediaType string) 
 
 	switch m := mediaMsg.(type) {
 	case *waE2E.AudioMessage:
-		url = m.GetUrl()
+		url = m.GetURL()
 		mediaKey = m.GetMediaKey()
 		mimetype = m.GetMimetype()
 		fileExt = ".ogg"
@@ -347,7 +342,7 @@ func downloadMedia(evt *events.Message, mediaMsg interface{}, mediaType string) 
 			fileExt = ".mp4"
 		}
 	case *waE2E.ImageMessage:
-		url = m.GetUrl()
+		url = m.GetURL()
 		mediaKey = m.GetMediaKey()
 		mimetype = m.GetMimetype()
 		fileExt = ".jpg"
@@ -368,13 +363,13 @@ func downloadMedia(evt *events.Message, mediaMsg interface{}, mediaType string) 
 
 	switch m := mediaMsg.(type) {
 	case *waE2E.AudioMessage:
-		data, err = client.Download(m)
+		data, err = client.Download(ctx, m)
 	case *waE2E.ImageMessage:
-		data, err = client.Download(m)
+		data, err = client.Download(ctx, m)
 	}
 
 	if err != nil {
-		// Fallback: tenta baixar direto via HTTP (sem descriptografia - pode falhar)
+		// Fallback: tenta baixar direto via HTTP
 		resp, httpErr := http.Get(url)
 		if httpErr != nil {
 			fmt.Fprintf(os.Stderr, "[Bridge] Erro ao baixar mídia: %v\n", err)
@@ -411,13 +406,11 @@ func updateChat(evt *events.Message, chatJID string, timestamp int64) {
 
 	var name string
 	if isGroup {
-		// Tenta obter nome do grupo via API
-		groupInfo, err := client.GetGroupInfo(evt.Info.Chat)
+		groupInfo, err := client.GetGroupInfo(ctx, evt.Info.Chat)
 		if err == nil && groupInfo != nil {
 			name = groupInfo.Name
 		}
 	} else {
-		// Para contatos individuais, usa o push name ou JID
 		name = evt.Info.PushName
 		if name == "" {
 			name = evt.Info.Sender.User

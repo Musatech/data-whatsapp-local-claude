@@ -74,7 +74,7 @@ echo -e "  ${BLUE}ℹ Logs em: $BRIDGE_LOG${NC}"
 sleep 1
 if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
     echo -e "${RED}✗ Bridge falhou ao iniciar. Verifique os logs:${NC}"
-    echo "  tail -f $BRIDGE_LOG"
+    echo "  tail -n +1 -f $BRIDGE_LOG"
     rm -f "$BRIDGE_PID_FILE"
     exit 1
 fi
@@ -87,7 +87,7 @@ echo ""
 echo "  O WhatsApp Bridge está rodando em segundo plano."
 echo ""
 echo "  Se for a primeira vez, o QR Code será exibido nos logs:"
-echo -e "  ${BLUE}tail -f $BRIDGE_LOG${NC}"
+echo -e "  ${BLUE}tail -n +1 -f $BRIDGE_LOG${NC}"
 echo ""
 echo "  Para parar: ${YELLOW}./stop.sh${NC}"
 echo ""
