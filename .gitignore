@@ -1,0 +1,49 @@
+# Data directories
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Media files
+media/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Go
+whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/*.exe
+
+# Environment
+.env
+
+# OS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Whisper model cache
+~/.cache/whisper/
+
+# WhatsApp session (contains auth tokens - NEVER commit)
+whatsapp-session.db
+whatsapp-session.db-shm
+whatsapp-session.db-wal
+
+# PID files
+*.pid

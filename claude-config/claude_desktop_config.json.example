@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "/CAMINHO/PARA/data-whatsapp-local-claude/mcp-server/.venv/bin/python",
+      "args": ["/CAMINHO/PARA/data-whatsapp-local-claude/mcp-server/server.py"],
+      "env": {
+        "MESSAGES_DB": "/CAMINHO/PARA/data-whatsapp-local-claude/data/messages.db",
+        "MEDIA_DIR": "/CAMINHO/PARA/data-whatsapp-local-claude/data/media",
+        "WHISPER_MODEL": "small",
+        "WHISPER_LANGUAGE": "pt"
+      }
+    }
+  }
+}
