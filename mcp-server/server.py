@@ -53,7 +53,12 @@ Use as ferramentas disponíveis para:
 
 Sempre responda em português, a menos que o usuário peça outro idioma.
 Ao mostrar mensagens, indique claramente quem enviou e o horário.
-Para grupos, indique o nome do participante em cada mensagem.""",
+Para grupos, indique o nome do participante em cada mensagem.
+
+IMPORTANTE sobre áudios:
+- Mensagens do tipo 'audio' E 'ptt' (voz gravada no WhatsApp) são AMBAS suportadas pela ferramenta transcrever_audio.
+- Nunca diga que PTT não pode ser transcrito — ele pode, use transcrever_audio normalmente.
+- Se não tiver arquivo local, o sistema baixa automaticamente. Tente sempre antes de desistir.""",
 )
 
 
@@ -342,8 +347,8 @@ def listar_audios(
         has_file = "✅" if audio.get("media_path") and os.path.exists(audio.get("media_path", "")) else "❌"
         has_transcript = "📝" if audio.get("transcription") else "⏳"
 
-        tipo = "🎤 PTT" if audio["message_type"] == "ptt" else "🔊 Áudio"
-        lines.append(f"**{tipo}** - {sender} [{ts}]")
+        tipo = "🔊 Voz (PTT)" if audio["message_type"] == "ptt" else "🔊 Áudio"
+        lines.append(f"**{tipo}** - {sender} [{ts}] *(pode ser transcrito)*")
         lines.append(f"  ID: `{audio['id']}`")
         lines.append(f"  JID: `{audio['chat_jid']}`")
         lines.append(f"  Arquivo: {has_file} | Transcrição: {has_transcript}")
