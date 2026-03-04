@@ -260,10 +260,25 @@ launchctl load ~/Library/LaunchAgents/com.whatsapp-local-claude.plist
 
 ## Atualizações
 
+Um único comando faz tudo: baixa as mudanças, recompila o bridge, atualiza dependências Python e reconfigura o Claude Desktop.
+
 ```bash
-git pull
-./install.sh
+git pull && ./install.sh
 ```
+
+O que acontece por baixo:
+1. `git pull` — baixa a versão mais recente do repositório
+2. `./install.sh` — recompila o bridge Go, atualiza pacotes Python, atualiza config do Claude Desktop e recarrega o LaunchAgent
+
+> O `install.sh` é idempotente — não apaga mensagens, sessão ou configurações pessoais (`.env`).
+
+Após atualizar, reinicie o bridge:
+
+```bash
+./stop.sh && ./start.sh
+```
+
+E reinicie o Claude Desktop (`Cmd+Q` → reabrir) para carregar o novo MCP server.
 
 ## Licença
 
