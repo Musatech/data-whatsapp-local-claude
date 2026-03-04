@@ -290,7 +290,51 @@ make_scripts_executable() {
     chmod +x "$ROOT_DIR/install.sh"
     chmod +x "$ROOT_DIR/start.sh"
     chmod +x "$ROOT_DIR/stop.sh"
+    chmod +x "$ROOT_DIR/launch-agent-helper.sh"
     print_ok "Scripts com permissão de execução"
+}
+
+setup_launch_agent() {
+    print_step "Configurando LaunchAgent (início automático no login)..."
+
+    PLIST_DIR="$HOME/Library/LaunchAgents"
+    PLIST_FILE="$PLIST_DIR/com.whatsapp-local-claude.plist"
+
+    mkdir -p "$PLIST_DIR"
+
+    cat > "$PLIST_FILE" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.whatsapp-local-claude</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>$ROOT_DIR/launch-agent-helper.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>$ROOT_DIR/data/logs/launch-agent.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$ROOT_DIR/data/logs/launch-agent.log</string>
+</dict>
+</plist>
+PLIST
+
+    # Recarrega se já estava carregado
+    launchctl unload "$PLIST_FILE" 2>/dev/null || true
+    launchctl load "$PLIST_FILE"
+
+    print_ok "LaunchAgent instalado — perguntará ao iniciar o Mac se quer ligar o bridge"
 }
 
 print_success() {
@@ -337,5 +381,6 @@ setup_python_env
 install_whisper_model
 setup_claude_desktop
 make_scripts_executable
+setup_launch_agent
 
 print_success
