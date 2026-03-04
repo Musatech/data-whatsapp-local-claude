@@ -336,7 +336,10 @@ func eventHandler(rawEvt interface{}) {
 		}
 	case *events.Connected:
 		fmt.Println("[Bridge] Conectado ao WhatsApp")
-		go syncContactsFromStore()
+		go func() {
+			syncContactsFromStore()
+			enrichContactNamesFromHistory()
+		}()
 	case *events.Disconnected:
 		fmt.Println("[Bridge] Desconectado do WhatsApp")
 	case *events.LoggedOut:
@@ -711,6 +714,59 @@ func handleGroupInfo(evt *events.GroupInfo) {
 			fmt.Fprintf(os.Stderr, "[Bridge] Erro ao atualizar nome do grupo: %v\n", err)
 		}
 	}
+}
+
+// enrichContactNamesFromHistory percorre o histórico de mensagens para preencher
+// nomes de chats/contatos que ainda estão sem nome após o syncContactsFromStore.
+// Prioridade: push_name de contacts → sender_name de mensagens → número do JID.
+func enrichContactNamesFromHistory() {
+	// 1. Usa push_name da tabela contacts para chats ainda sem nome
+	res1, _ := msgDB.Exec(`
+		UPDATE chats
+		SET name = (
+			SELECT COALESCE(NULLIF(ct.name,''), ct.push_name)
+			FROM contacts ct
+			WHERE ct.jid = chats.jid
+			  AND (ct.name != '' OR ct.push_name != '')
+			LIMIT 1
+		)
+		WHERE (name IS NULL OR name = '') AND is_group = 0
+		  AND EXISTS (
+			SELECT 1 FROM contacts ct WHERE ct.jid = chats.jid
+			  AND (ct.name IS NOT NULL AND ct.name != ''
+			       OR ct.push_name IS NOT NULL AND ct.push_name != '')
+		  )`)
+	n1, _ := res1.RowsAffected()
+
+	// 2. Usa sender_name do histórico de mensagens para os que restam
+	res2, _ := msgDB.Exec(`
+		UPDATE chats
+		SET name = (
+			SELECT sender_name FROM messages
+			WHERE messages.chat_jid = chats.jid
+			  AND messages.is_from_me = 0
+			  AND messages.sender_name IS NOT NULL
+			  AND messages.sender_name != ''
+			ORDER BY messages.timestamp DESC LIMIT 1
+		)
+		WHERE (name IS NULL OR name = '') AND is_group = 0
+		  AND EXISTS (
+			SELECT 1 FROM messages
+			WHERE messages.chat_jid = chats.jid
+			  AND messages.is_from_me = 0
+			  AND messages.sender_name IS NOT NULL AND messages.sender_name != ''
+		  )`)
+	n2, _ := res2.RowsAffected()
+
+	// 3. Fallback: usa número de telefone extraído do JID (@s.whatsapp.net)
+	res3, _ := msgDB.Exec(`
+		UPDATE chats
+		SET name = '+' || REPLACE(jid, '@s.whatsapp.net', '')
+		WHERE (name IS NULL OR name = '') AND is_group = 0
+		  AND jid LIKE '%@s.whatsapp.net'`)
+	n3, _ := res3.RowsAffected()
+
+	fmt.Printf("[Bridge] Enriquecimento de nomes: %d de contacts, %d do histórico, %d de número de telefone\n", n1, n2, n3)
 }
 
 // syncContactsFromStore lê todos os contatos do store do whatsmeow (agenda do celular
