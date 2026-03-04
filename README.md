@@ -260,25 +260,42 @@ launchctl load ~/Library/LaunchAgents/com.whatsapp-local-claude.plist
 
 ## Atualizações
 
+### Já tenho o repo clonado
+
 Um único comando faz tudo: baixa as mudanças, recompila o bridge, atualiza dependências Python e reconfigura o Claude Desktop.
 
 ```bash
-git pull && ./install.sh
+cd ~/git/data-whatsapp-local-claude && git pull && ./install.sh
 ```
 
-O que acontece por baixo:
-1. `git pull` — baixa a versão mais recente do repositório
-2. `./install.sh` — recompila o bridge Go, atualiza pacotes Python, atualiza config do Claude Desktop e recarrega o LaunchAgent
+> Substitua `~/git/data-whatsapp-local-claude` pelo caminho onde você clonou o projeto.
 
-> O `install.sh` é idempotente — não apaga mensagens, sessão ou configurações pessoais (`.env`).
+### Não tenho o repo ainda (instalação nova)
 
-Após atualizar, reinicie o bridge:
+```bash
+git clone https://github.com/Musatech/data-whatsapp-local-claude.git
+cd data-whatsapp-local-claude
+./install.sh
+```
+
+---
+
+O que o `./install.sh` faz em ambos os casos:
+1. Instala/atualiza dependências (Go, Python, ffmpeg)
+2. Recompila o bridge Go
+3. Atualiza pacotes Python
+4. Atualiza a configuração do Claude Desktop
+5. Recarrega o LaunchAgent
+
+> O `install.sh` é idempotente — não apaga mensagens, sessão WhatsApp ou configurações pessoais (`.env`).
+
+Após atualizar, reinicie o bridge e o Claude Desktop:
 
 ```bash
 ./stop.sh && ./start.sh
 ```
 
-E reinicie o Claude Desktop (`Cmd+Q` → reabrir) para carregar o novo MCP server.
+`Cmd+Q` no Claude Desktop → reabrir.
 
 ## Licença
 
