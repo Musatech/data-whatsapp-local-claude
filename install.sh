@@ -254,7 +254,9 @@ config["mcpServers"]["whatsapp"] = {
         "MESSAGES_DB": "$ROOT_DIR/data/messages.db",
         "MEDIA_DIR": "$ROOT_DIR/data/media",
         "WHISPER_MODEL": "${WHISPER_MODEL:-small}",
-        "WHISPER_LANGUAGE": "${WHISPER_LANGUAGE:-pt}"
+        "WHISPER_LANGUAGE": "${WHISPER_LANGUAGE:-pt}",
+        "BRIDGE_PORT": "8765",
+        "PATH": "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     }
 }
 
@@ -277,7 +279,9 @@ PYEOF
         "MESSAGES_DB": "$ROOT_DIR/data/messages.db",
         "MEDIA_DIR": "$ROOT_DIR/data/media",
         "WHISPER_MODEL": "small",
-        "WHISPER_LANGUAGE": "pt"
+        "WHISPER_LANGUAGE": "pt",
+        "BRIDGE_PORT": "8765",
+        "PATH": "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
       }
     }
   }
