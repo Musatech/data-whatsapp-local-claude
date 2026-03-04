@@ -417,6 +417,13 @@ func handleHistorySync(evt *events.HistorySync) {
 			chatJID, chatName, boolToInt(isGroup),
 		)
 
+		// HistorySync como primeira fonte: salva o nome na tabela contacts também
+		// (para contatos individuais). syncContactsFromStore sobrescreve depois
+		// com o FullName da agenda se disponível.
+		if !isGroup && chatName != "" {
+			updateContact(chatJID, chatName, "")
+		}
+
 		for _, histMsg := range conv.GetMessages() {
 			webMsg := histMsg.GetMessage()
 			if webMsg == nil {
@@ -440,6 +447,11 @@ func handleHistorySync(evt *events.HistorySync) {
 
 			senderName := webMsg.GetPushName()
 			timestamp := int64(webMsg.GetMessageTimestamp())
+
+			// Salva push_name do histórico na tabela contacts
+			if senderName != "" {
+				updateContact(senderJID, "", senderName)
+			}
 
 			msgType, content, mediaInfoJSON := extractFromProto(msgInfo)
 			if msgType == "" {
@@ -716,9 +728,12 @@ func handleGroupInfo(evt *events.GroupInfo) {
 	}
 }
 
-// enrichContactNamesFromHistory percorre o histórico de mensagens para preencher
-// nomes de chats/contatos que ainda estão sem nome após o syncContactsFromStore.
-// Prioridade: push_name de contacts → sender_name de mensagens → número do JID.
+// enrichContactNamesFromHistory preenche nomes de chats ainda sem nome.
+// Ordem de prioridade:
+//  1. contacts.name  (HistorySync conv.GetName + agenda via syncContactsFromStore)
+//  2. contacts.push_name (PushName dos remetentes do histórico)
+//  3. messages.sender_name (fallback direto das mensagens)
+//  4. Número de telefone extraído do JID (@s.whatsapp.net)
 func enrichContactNamesFromHistory() {
 	// 1. Usa push_name da tabela contacts para chats ainda sem nome
 	res1, _ := msgDB.Exec(`
