@@ -215,17 +215,8 @@ setup_claude_desktop() {
         cp "$CLAUDE_CONFIG" "${CLAUDE_CONFIG}.backup.$(date +%Y%m%d_%H%M%S)"
     fi
 
-    # Verifica se já tem a entrada whatsapp
-    if [[ -f "$CLAUDE_CONFIG" ]] && python3 -c "
-import json, sys
-with open('$CLAUDE_CONFIG') as f:
-    config = json.load(f)
-sys.exit(0 if 'whatsapp' in config.get('mcpServers', {}) else 1)
-" 2>/dev/null; then
-        print_info "Configuração WhatsApp já existe no Claude Desktop"
-    else
-        # Cria ou atualiza configuração
-        python3 << PYEOF
+    # Sempre cria ou atualiza a entrada whatsapp (garante config correta em reinstalações)
+    python3 << PYEOF
 import json
 import os
 
@@ -265,8 +256,7 @@ with open(config_path, 'w') as f:
 
 print("  Configuração salva em: " + config_path)
 PYEOF
-        print_ok "Claude Desktop configurado"
-    fi
+    print_ok "Claude Desktop configurado"
 
     # Também cria o arquivo de exemplo
     cat > "$ROOT_DIR/claude-config/claude_desktop_config.json.example" << JSONEOF
