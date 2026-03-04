@@ -336,6 +336,7 @@ func eventHandler(rawEvt interface{}) {
 		}
 	case *events.Connected:
 		fmt.Println("[Bridge] Conectado ao WhatsApp")
+		go syncContactsFromStore()
 	case *events.Disconnected:
 		fmt.Println("[Bridge] Desconectado do WhatsApp")
 	case *events.LoggedOut:
@@ -710,6 +711,53 @@ func handleGroupInfo(evt *events.GroupInfo) {
 			fmt.Fprintf(os.Stderr, "[Bridge] Erro ao atualizar nome do grupo: %v\n", err)
 		}
 	}
+}
+
+// syncContactsFromStore lê todos os contatos do store do whatsmeow (agenda do celular
+// sincronizada pelo WhatsApp) e atualiza o banco com o FullName de cada um.
+func syncContactsFromStore() {
+	contacts, err := client.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[Bridge] Erro ao buscar contatos da agenda: %v\n", err)
+		return
+	}
+
+	updated := 0
+	for jid, info := range contacts {
+		// Usa FullName (agenda) com fallback para PushName (nome no WhatsApp)
+		name := info.FullName
+		if name == "" {
+			name = info.PushName
+		}
+		if name == "" {
+			continue
+		}
+
+		jidStr := jid.String()
+
+		// Atualiza tabela contacts — FullName tem prioridade sobre push_name existente
+		_, _ = msgDB.Exec(
+			`INSERT INTO contacts (jid, name, push_name, updated_at)
+			VALUES (?, ?, ?, strftime('%s', 'now'))
+			ON CONFLICT(jid) DO UPDATE SET
+				name = COALESCE(NULLIF(excluded.name, ''), name),
+				push_name = COALESCE(NULLIF(excluded.push_name, ''), push_name),
+				updated_at = excluded.updated_at`,
+			jidStr, info.FullName, info.PushName,
+		)
+
+		// Se tiver FullName da agenda, ele é autoritativo — sempre atualiza o chat
+		if info.FullName != "" {
+			_, _ = msgDB.Exec(
+				`UPDATE chats SET name = ? WHERE jid = ?`,
+				info.FullName, jidStr,
+			)
+		}
+
+		updated++
+	}
+
+	fmt.Printf("[Bridge] Agenda sincronizada: %d contatos atualizados\n", updated)
 }
 
 func updateContact(jid, name, pushName string) {

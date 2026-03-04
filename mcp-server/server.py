@@ -470,7 +470,7 @@ def estatisticas() -> str:
 def _resolve_chat(identifier: str) -> Optional[str]:
     """
     Resolve um nome ou JID parcial para o JID completo de uma conversa.
-    Tenta corresponder por JID exato, depois por nome (case-insensitive).
+    Prioridade: JID exato → nome em chats → nome/push_name em contacts → JID parcial.
     """
     with db.get_connection() as conn:
         # Tentativa 1: JID exato
@@ -480,7 +480,7 @@ def _resolve_chat(identifier: str) -> Optional[str]:
         if row:
             return row["jid"]
 
-        # Tentativa 2: busca por nome (case-insensitive, parcial)
+        # Tentativa 2: busca por nome na tabela chats (case-insensitive, parcial)
         row = conn.execute(
             "SELECT jid FROM chats WHERE LOWER(name) LIKE LOWER(?) ORDER BY last_message_time DESC LIMIT 1",
             (f"%{identifier}%",),
@@ -488,7 +488,19 @@ def _resolve_chat(identifier: str) -> Optional[str]:
         if row:
             return row["jid"]
 
-        # Tentativa 3: JID com sufixo (usuário digitou só o número)
+        # Tentativa 3: busca por nome ou push_name na tabela contacts (agenda do celular)
+        row = conn.execute(
+            """SELECT c.jid FROM chats c
+               JOIN contacts ct ON c.jid = ct.jid
+               WHERE LOWER(ct.name) LIKE LOWER(?)
+                  OR LOWER(ct.push_name) LIKE LOWER(?)
+               ORDER BY c.last_message_time DESC LIMIT 1""",
+            (f"%{identifier}%", f"%{identifier}%"),
+        ).fetchone()
+        if row:
+            return row["jid"]
+
+        # Tentativa 4: JID com sufixo (usuário digitou só o número)
         row = conn.execute(
             "SELECT jid FROM chats WHERE jid LIKE ? ORDER BY last_message_time DESC LIMIT 1",
             (f"%{identifier}%",),
