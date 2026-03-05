@@ -24,9 +24,13 @@ echo -e "${BLUE}=====================================${NC}"
 echo ""
 
 # ─── Verifica se o bridge já está rodando ───
+# Valida o PID E confirma que pertence ao nosso binário
+# (evita falso positivo após reboot, quando o macOS reutiliza PIDs)
+BRIDGE_BIN_NAME="whatsapp-bridge"
 if [[ -f "$BRIDGE_PID_FILE" ]]; then
     OLD_PID=$(cat "$BRIDGE_PID_FILE")
-    if kill -0 "$OLD_PID" 2>/dev/null; then
+    if kill -0 "$OLD_PID" 2>/dev/null && \
+       ps -p "$OLD_PID" -o comm= 2>/dev/null | grep -q "$BRIDGE_BIN_NAME"; then
         echo -e "${YELLOW}⚠ WhatsApp Bridge já está rodando (PID: $OLD_PID)${NC}"
         echo "  Use ./stop.sh para encerrar antes de reiniciar."
         exit 0

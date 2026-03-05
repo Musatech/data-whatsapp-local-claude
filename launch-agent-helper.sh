@@ -6,8 +6,8 @@
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Aguarda o ambiente do usuário estar pronto (Dock, etc.)
-sleep 5
+# Aguarda o ambiente do usuário estar pronto (Dock, rede, etc.)
+sleep 10
 
 # Mostra diálogo de confirmação via AppleScript
 RESULT=$(osascript <<'EOF'
